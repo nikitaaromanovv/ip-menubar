@@ -1,0 +1,11 @@
+# Local only: tests, tools, notes
+dev/
+venv/
+venv-release/
+build/
+dist/
+__pycache__/
+*.pyc
+*.egg-info/
+*.log
+.DS_Store

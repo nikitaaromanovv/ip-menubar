@@ -1,0 +1,7 @@
+-r requirements.txt
+altgraph==0.17.5
+macholib==1.16.4
+modulegraph==0.19.7
+packaging==26.2
+py2app==0.28.10
+setuptools==83.0.0

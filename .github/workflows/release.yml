@@ -1,0 +1,147 @@
+# Release build on GitHub's macOS machines with Python from python.org, so the app also
+# runs on older macOS (Homebrew Python only runs on the macOS it was built on).
+#   git tag -a v1.6.0 -m "Что нового" && git push origin v1.6.0   -> build and publish
+#   Actions -> Release -> Run workflow                             -> test build only
+# Release assets have stable names: IP-Menubar.dmg and install.sh.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      PYTHON_VERSION: 3.14.10
+      PY: /Library/Frameworks/Python.framework/Versions/3.14/bin/python3
+      MIN_MACOS: '13.0'
+      APP: dist/IP Menubar.app
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Version
+        run: |
+          V=$(sed -n 's/.*"CFBundleShortVersionString": "\(.*\)".*/\1/p' setup.py)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "v$V" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Тег $GITHUB_REF_NAME, а в setup.py версия $V"; exit 1
+          fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Python from python.org
+        run: |
+          curl -fsSLo /tmp/python.pkg "https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-macos11.pkg"
+          sudo installer -pkg /tmp/python.pkg -target /
+          "$PY" -m venv /tmp/venv
+          /tmp/venv/bin/python -m pip install -q --upgrade pip
+          /tmp/venv/bin/python -m pip install -q -r requirements-build.txt
+
+      - name: Build app
+        run: |
+          if ! /tmp/venv/bin/python setup.py py2app > /tmp/build.log 2>&1; then
+            # py2app signs as its last step and hides codesign's message; sign here instead.
+            if grep -q "Cannot sign bundle" /tmp/build.log && [ -d "$APP" ]; then
+              codesign --force --deep --sign - "$APP" || { xattr -cr "$APP"; codesign --force --deep --sign - "$APP"; }
+            else
+              tail -60 /tmp/build.log; exit 1
+            fi
+          fi
+          codesign --verify --deep --strict "$APP"
+          lipo -archs "$APP/Contents/MacOS/IP Menubar"
+
+      - name: Minimum macOS
+        run: |
+          /tmp/venv/bin/python - "$APP" "$MIN_MACOS" <<'EOF'
+          import os, struct, sys
+          app, limit = sys.argv[1], tuple(int(x) for x in sys.argv[2].split('.')[:2])
+          def versions(path):
+              data = open(path, 'rb').read()
+              offsets = [0]
+              if data[:4] == b'\xca\xfe\xba\xbe':
+                  count = struct.unpack('>I', data[4:8])[0]
+                  offsets = [struct.unpack('>5I', data[8 + i * 20:28 + i * 20])[2] for i in range(count)]
+              for offset in offsets:
+                  if struct.unpack('<I', data[offset:offset + 4])[0] != 0xfeedfacf:
+                      continue
+                  position = offset + 32
+                  for _ in range(struct.unpack('<I', data[offset + 16:offset + 20])[0]):
+                      command, size = struct.unpack('<II', data[position:position + 8])
+                      field = {0x32: 12, 0x24: 8}.get(command)   # LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX
+                      if field:
+                          value = struct.unpack('<I', data[position + field:position + field + 4])[0]
+                          yield value >> 16, (value >> 8) & 255
+                      position += size
+          bad, newest, checked = [], (0, 0), 0
+          for root, _, files in os.walk(app):
+              for name in files:
+                  path = os.path.join(root, name)
+                  if os.path.islink(path) or open(path, 'rb').read(4) not in (b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe'):
+                      continue
+                  checked += 1
+                  for version in versions(path):
+                      newest = max(newest, version)
+                      if version > limit:
+                          bad.append(f'{os.path.relpath(path, app)} needs macOS {version[0]}.{version[1]}')
+          print(f'{checked} binaries, newest requirement macOS {newest[0]}.{newest[1]}')
+          sys.exit('\n'.join(bad[:20]) if bad else 0)
+          EOF
+
+      - name: Launch check (does not block the release)
+        continue-on-error: true
+        run: |
+          "$APP/Contents/MacOS/IP Menubar" --smoke-test &
+          PID=$!
+          ( sleep 90; kill "$PID" 2>/dev/null ) &
+          wait "$PID"
+
+      - name: DMG and installer
+        run: |
+          STAGE=$(mktemp -d)
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "IP Menubar $VERSION" -srcfolder "$STAGE" -ov -format UDZO ../IP-Menubar.dmg > /dev/null
+          SUM=$(shasum -a 256 ../IP-Menubar.dmg | cut -d' ' -f1)
+          sed -e "s/@VERSION@/$VERSION/" -e "s/@SHA256@/$SUM/" ../.github/install.sh > ../install.sh
+          chmod +x ../install.sh
+          echo "$SUM  IP-Menubar.dmg"
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: IP-Menubar-${{ env.VERSION }}
+          path: |
+            IP-Menubar.dmg
+            install.sh
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Release text: the annotated tag message, then installation.
+          SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.sha)
+          TYPE=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.type)
+          [ "$TYPE" = tag ] && gh api "repos/$GITHUB_REPOSITORY/git/tags/$SHA" --jq .message > notes.md || : > notes.md
+          cat >> notes.md <<EOF
+
+          ### Установка
+
+          Терминал:
+
+          \`\`\`
+          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh | sh
+          \`\`\`
+
+          Или скачайте IP-Menubar.dmg ниже и перетащите приложение в «Программы».
+          EOF
+          gh release create "$GITHUB_REF_NAME" IP-Menubar.dmg install.sh \
+            --title "IP Menubar $VERSION" --notes-file notes.md --latest
